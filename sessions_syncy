@@ -1,0 +1,73 @@
+import os
+import base64
+import time
+import threading
+from github import Github
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
+
+# Connect to GitHub
+def get_repo():
+    g = Github(GITHUB_TOKEN)
+    return g.get_user(GITHUB_OWNER).get_repo(GITHUB_REPO)
+
+# Upload sessions to GitHub
+def upload_sessions():
+    repo = get_repo()
+    for filename in os.listdir(SESSIONS_DIR):
+        filepath = os.path.join(SESSIONS_DIR, filename)
+
+        if not os.path.isfile(filepath):
+            continue
+        
+        with open(filepath, "rb") as f:
+            content = f.read()
+
+        try:
+            file = repo.get_contents(f"{SESSIONS_DIR}/{filename}")
+            repo.update_file(
+                file.path,
+                f"Update session {filename}",
+                content,
+                file.sha
+            )
+        except:
+            repo.create_file(
+                f"{SESSIONS_DIR}/{filename}",
+                f"Add session {filename}",
+                content
+            )
+    print("✔ Sessions synced to GitHub")
+
+# Download sessions from GitHub
+def download_sessions():
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    repo = get_repo()
+
+    try:
+        files = repo.get_contents(SESSIONS_DIR)
+    except:
+        return
+
+    for file in files:
+        local_path = os.path.join(SESSIONS_DIR, file.name)
+        content = base64.b64decode(file.content)
+
+        with open(local_path, "wb") as f:
+            f.write(content)
+
+    print("✔ Sessions downloaded from GitHub")
+
+# Background thread for auto-sync every 60 sec
+def auto_sync():
+    while True:
+        upload_sessions()
+        time.sleep(60)
+
+def start_session_sync():
+    download_sessions()
+    t = threading.Thread(target=auto_sync, daemon=True)
+    t.start()
