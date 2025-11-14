@@ -1,10 +1,13 @@
 services:
   - type: web
-    name: Maestro-Server
+    name: maestro-backend
     env: python
-    plan: free
-    region: frankfurt
-    buildCommand: |
-      pip install -r requirements.txt
-    startCommand: |
-      bash start.sh
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "./start.sh"
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
