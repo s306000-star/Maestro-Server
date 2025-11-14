@@ -44,22 +44,20 @@ for key, path in CONFIG.items():
 # ============================================================
 # 🔗 تحميل وربط الـ Blueprints تلقائيًا
 # ============================================================
-# Do not import blueprints at the top level to avoid circular dependencies.
-# The dynamic import loop handles this safely.
-modules = ["auth", "sessions", "sgroups", "publish", "filters", "smart_join"]
+# القائمة المعدّلة بشكل صحيح 🔥
+modules = ["auth", "sessions", "sgroups", "publish", "filters", "smart_safe_join"]
 
 for module_name in modules:
     try:
-        # Dynamically import the module
         mod = import_module(module_name)
-        # We assume the blueprint variable is named e.g. auth_bp
         bp = getattr(mod, f"{module_name}_bp")
-        # Register the blueprint
         app.register_blueprint(bp, url_prefix="/api")
         logger.info(f"✅ Registered module: {module_name}")
     except Exception as e:
-        # Log any errors during module registration
-        logger.error(f"❌ Failed to register module '{module_name}': {e}", exc_info=True)
+        logger.error(
+            f"❌ Failed to register module '{module_name}': {e}",
+            exc_info=True
+        )
 
 # ============================================================
 # 🏠 الصفحة الرئيسية (Index)
@@ -87,7 +85,6 @@ def index():
 # ============================================================
 @app.route('/favicon.ico')
 def favicon():
-    """معالجة طلب المتصفح لملف favicon.ico لمنع أخطاء 404."""
     return Response(status=204)
 
 # ============================================================
@@ -95,7 +92,6 @@ def favicon():
 # ============================================================
 @app.route("/status", methods=["GET"])
 def status():
-    """التحقق من حالة السيرفر."""
     return jsonify({
         "ok": True,
         "status": "running",
@@ -110,7 +106,6 @@ def status():
 @app.errorhandler(Exception)
 def handle_exception(e):
     logger.exception("Unhandled Exception: %s", e)
-    # Use the unified format_response for error handling
     from utils import format_response
     return format_response(
         success=False,
@@ -128,4 +123,3 @@ if __name__ == "__main__":
         host=CONFIG["HOST"],
         port=CONFIG["PORT"]
     )
-
