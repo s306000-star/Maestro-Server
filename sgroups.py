@@ -1,197 +1,142 @@
 # -*- coding: utf-8 -*-
 """
-sgroups.py – Smart Group & Channel Analyzer
---------------------------------------------
-✅ يقوم بفحص كل القنوات والمجموعات في الحساب المحدد
-✅ يرسل رسالة اختبار إلى المجموعات القابلة للنشر فقط
-✅ يغادر جميع القنوات بدون استثناء
-✅ يغادر المجموعات التي لا يمكن النشر بها (محظورة / مقيدة / مغلقة)
+sgroups.py – Smart Group & Channel Analyzer (MongoDB + Pyrogram Edition)
+———————————————————————————————————————————————
+✓ يعمل بدون أي ملفات جلسات
+✓ يعتمد على Session String المخزنة في MongoDB
+✓ فحص المجموعات والقنوات – ينشر رسالة اختبار – يغادر القنوات
 """
 
-from flask import Blueprint, request
-from telethon import TelegramClient, errors
-from telethon.tl.functions.channels import GetFullChannelRequest, LeaveChannelRequest
-from telethon.tl.types import ChannelParticipantsBots, PeerUser
-import asyncio, logging
-from config import CONFIG
-from sessions import load_session_config_by_name, run_with_safe_clone
-from utils import format_response, run_in_new_loop
+from flask import Blueprint, request, jsonify, current_app
+from pyrogram import Client, errors
+import asyncio
 
 sgroups_bp = Blueprint("sgroups", __name__)
 
+
 # ======================================================
-# 🧩 فحص صلاحيات النشر داخل كيان (مجموعة أو قناة)
+# 🔧 جلب جلسة الحساب من MongoDB
 # ======================================================
-async def test_post_permission(client, entity, test_message="🔷 Test message (auto-check)"):
+def get_account(phone):
+    col = current_app.sessions_collection
+    acc = col.find_one({"phone": phone})
+    return acc
+
+
+# ======================================================
+# 🧩 فحص إرسال رسالة اختبار
+# ======================================================
+async def test_post_permission(client, chat_id, test_message):
     try:
-        msg = await client.send_message(entity, test_message)
-        return {"can_post": True, "reason": "✅ Can post message"}
-    except errors.ChatWriteForbiddenError:
-        return {"can_post": False, "reason": "🚫 Write forbidden in this chat"}
-    except errors.UserBannedInChannelError:
-        return {"can_post": False, "reason": "⛔ User banned in this channel"}
-    except errors.FloodWaitError as fw:
-        await asyncio.sleep(fw.seconds + 1)
-        return {"can_post": False, "reason": f"⏳ Flood wait for {fw.seconds}s"}
+        await client.send_message(chat_id, test_message)
+        return True, "✔️ Can post message"
+    except errors.ChatWriteForbidden:
+        return False, "⛔ Write forbidden"
+    except errors.UserBannedInChannel:
+        return False, "⛔ User banned"
     except Exception as e:
-        return {"can_post": False, "reason": f"❌ Exception: {e}"}
+        return False, f"❌ {e}"
 
 
 # ======================================================
-# 🧠 تحليل ذكي للمجموعة أو القناة
+# 🧠 تحليل مجموعة / قناة
 # ======================================================
-async def analyze_group(client, entity, test_message="🔷 Test", auto_leave=False, leave_log=None):
-    """
-    - يجرب إرسال رسالة للمجموعات فقط التي يمكن النشر بها.
-    - يغادر جميع القنوات.
-    - يغادر المجموعات التي لا يمكن النشر بها.
-    """
-    status = "ok"
-    reason = "✅ Message test passed"
-    can_post = True
+async def analyze_dialog(client, dialog, test_message, auto_leave):
+    chat = dialog.chat
+    chat_id = chat.id
+    title = chat.title or "Unknown"
 
-    try:
-        # تجاهل المستخدمين
-        if isinstance(entity, PeerUser):
-            return None
+    # تجاهل المحادثات الخاصة
+    if chat.type == "private":
+        return None
 
-        # تحديد نوع الكيان
-        full = await client(GetFullChannelRequest(entity))
-        entity_type = "channel" if getattr(entity, "broadcast", False) else "group"
+    # فحص القابلية للنشر
+    can_post, reason = await test_post_permission(client, chat_id, test_message)
 
-        # فحص صلاحيات النشر
-        probe = await test_post_permission(client, entity, test_message)
-        can_post = probe["can_post"]
-        reason = probe["reason"]
-
-        # 💬 إرسال فعلي فقط للمجموعات القابلة للنشر
-        if entity_type == "group" and can_post:
+    # مغادرة القنوات دائمًا في وضع Auto-Leave
+    if auto_leave and chat.type in ["channel", "supergroup"]:
+        if not can_post:
             try:
-                await client.send_message(entity, test_message)
-                reason = "✅ Test message sent successfully to group"
+                await client.leave_chat(chat_id)
+                return {
+                    "id": chat_id,
+                    "name": title,
+                    "type": chat.type,
+                    "status": "left",
+                    "reason": "🚪 Left (Not allowed to post)"
+                }
             except Exception as e:
-                can_post = False
-                status = "error"
-                reason = f"❌ Failed to send message: {e}"
-
-        # 🚪 الخروج الذكي
-        if auto_leave:
-            # 1️⃣ يغادر جميع القنوات بدون استثناء
-            if entity_type == "channel":
-                try:
-                    await client(LeaveChannelRequest(entity))
-                    if leave_log is not None:
-                        leave_log.append({
-                            "id": entity.id,
-                            "name": getattr(entity, "title", "Unknown"),
-                            "reason": "🧹 Auto-left (channel cleanup)"
-                        })
-                except Exception as e:
-                    logging.warning(f"⚠️ Failed to leave channel {entity.id}: {e}")
-
-            # 2️⃣ يغادر المجموعات التي لا يمكن النشر بها
-            elif entity_type == "group" and not can_post:
-                try:
-                    await client(LeaveChannelRequest(entity))
-                    if leave_log is not None:
-                        leave_log.append({
-                            "id": entity.id,
-                            "name": getattr(entity, "title", "Unknown"),
-                            "reason": reason
-                        })
-                except Exception as e:
-                    logging.warning(f"⚠️ Failed to leave group {entity.id}: {e}")
-
-        # الحالة النهائية
-        status = "ok" if can_post else "restricted"
-        return {
-            "id": entity.id,
-            "name": getattr(entity, "title", "Unknown"),
-            "type": entity_type,
-            "status": status,
-            "reason": reason,
-            "can_post": can_post,
-        }
-
-    except Exception as e:
-        return {
-            "id": getattr(entity, "id", 0),
-            "name": getattr(entity, "title", "Unknown"),
-            "status": "error",
-            "reason": f"Exception: {e}",
-            "can_post": False
-        }
-
-
-# ======================================================
-# 📊 فحص كل القنوات والمجموعات
-# ======================================================
-async def scan_all_groups(client, test_message="🔷 Test", auto_leave=False):
-    dialogs = await client.get_dialogs(limit=None)
-    groups = []
-    leave_log = []
-    sem = asyncio.Semaphore(5)
-
-    async def worker(dialog):
-        async with sem:
-            e = dialog.entity
-            if isinstance(e, PeerUser):
-                return  # تجاهل المستخدمين تمامًا
-            try:
-                info = await analyze_group(client, e, test_message=test_message, auto_leave=auto_leave, leave_log=leave_log)
-                if info:
-                    groups.append(info)
-            except Exception as ex:
-                groups.append({
-                    "name": getattr(e, "title", "Unknown"),
+                return {
+                    "id": chat_id,
+                    "name": title,
                     "status": "error",
-                    "reason": str(ex)
-                })
+                    "reason": str(e)
+                }
 
-    await asyncio.gather(*[worker(d) for d in dialogs])
-    return {"groups": groups, "left_log": leave_log}
+    return {
+        "id": chat_id,
+        "name": title,
+        "type": chat.type,
+        "status": "ok" if can_post else "restricted",
+        "reason": reason,
+        "can_post": can_post
+    }
 
 
 # ======================================================
-# 🚀 المهمة الرئيسية الخاصة بالفحص
+# 📊 فحص جميع المجموعات
 # ======================================================
-async def scan_groups_task(session_name, test_message, auto_leave):
+async def scan_all_groups_pyrogram(phone, test_message, auto_leave):
+    acc = get_account(phone)
+    if not acc:
+        return {"error": "Account not found"}
+
+    session_string = acc["session"]
+    api_id = acc["api_id"]
+    api_hash = acc["api_hash"]
+
+    client = Client(
+        name=phone,
+        session_string=session_string,
+        api_id=api_id,
+        api_hash=api_hash
+    )
+
+    results = []
     try:
-        base_name = session_name.replace('.session', '').replace('web_session_', '').strip()
-        final_base_name = f"web_session_{base_name}"
+        await client.connect()
+        dialogs = await client.get_dialogs()
 
-        async def work(client):
-            result_data = await scan_all_groups(client, test_message=test_message, auto_leave=auto_leave)
-            summary = {}
-            for g in result_data["groups"]:
-                status = g.get("status", "unknown")
-                summary[status] = summary.get(status, 0) + 1
-            summary["total"] = len(result_data["groups"])
-            return {"summary": summary, "groups": result_data["groups"], "left_log": result_data["left_log"]}
+        for d in dialogs:
+            info = await analyze_dialog(client, d, test_message, auto_leave)
+            if info:
+                results.append(info)
 
-        result = await run_with_safe_clone(final_base_name, work)
-        return format_response(data=result)
+        await client.disconnect()
 
-    except FileNotFoundError:
-        return format_response(success=False, error="Session file or config not found.", code=404)
-    except PermissionError:
-        return format_response(success=False, error="Session not authorized. Please re-authenticate.", code=403)
+        return {"groups": results}
+
     except Exception as e:
-        logging.exception("scan-groups task failed")
-        return format_response(success=False, error=str(e), code=500)
+        return {"error": str(e)}
 
 
 # ======================================================
-# 🌐 مسار API الرئيسي
+# 🌐 API – فحص جميع المجموعات
 # ======================================================
 @sgroups_bp.route("/scan-groups", methods=["POST"])
 def scan_groups_route():
-    data = request.get_json(silent=True) or {}
-    session_name = data.get("session_name")
-    if not session_name:
-        return format_response(success=False, error="Missing session_name", code=400)
-
-    test_message = data.get("test_message", "🔷 Test message (auto-check)")
+    data = request.json
+    phone = data.get("session_name")  # اسم الحقل من الواجهة
+    test_message = data.get("test_message", "🔷 Test message")
     auto_leave = data.get("auto_leave_on_fail", False)
 
-    return run_in_new_loop(scan_groups_task(session_name, test_message, auto_leave))
+    if not phone:
+        return jsonify({"ok": False, "error": "Missing session_name"}), 400
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(
+        scan_all_groups_pyrogram(phone, test_message, auto_leave)
+    )
+
+    return jsonify({"ok": True, "data": result})
