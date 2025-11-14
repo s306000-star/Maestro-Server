@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 smart_safe_join.py — Smart & Safe Join (Pyrogram + MongoDB Edition)
+Final Production Version — Fully Compatible with app.py and Render
 """
 
 from flask import Blueprint, request, jsonify, current_app
 from pyrogram import Client, errors
-import asyncio, re, random
-
-smart_join_bp = Blueprint("smart_join", __name__)
+import asyncio
+import re
+import random
 
 # ============================================================
-# 🔧 جلب الحساب من MongoDB
+# 🟢 Blueprint — IMPORTANT: Correct name for app.py autoload
 # ============================================================
+smart_safe_join_bp = Blueprint("smart_safe_join", __name__)
 
+# ============================================================
+# 📌 جلب الحساب من MongoDB
+# ============================================================
 def get_account(phone):
     col = current_app.sessions_collection
     return col.find_one({"phone": phone})
@@ -21,7 +26,6 @@ def get_account(phone):
 # ============================================================
 # 🔍 استخراج الروابط من النص
 # ============================================================
-
 INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)?([A-Za-z0-9_-]+)")
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,})")
 
@@ -32,11 +36,9 @@ def extract_links(text):
 
 
 # ============================================================
-# 🧠 محاولة الانضمام إلى رابط واحد
+# 🔑 محاولة الانضمام إلى رابط واحد
 # ============================================================
-
 async def join_single(client, token, safe_mode=True):
-    # token قد يكون username أو invite hash
     try:
         # username
         if token.isalnum() and not token.startswith("+"):
@@ -50,6 +52,7 @@ async def join_single(client, token, safe_mode=True):
 
         # invite hash
         else:
+            info = None
             if safe_mode:
                 info = await client.get_chat(token)
                 if info.type == "channel":
@@ -69,9 +72,8 @@ async def join_single(client, token, safe_mode=True):
 
 
 # ============================================================
-# 🚀 تنفيذ حملة انضمام كاملة
+# 🚀 تنفيذ حملة Smart Join كاملة
 # ============================================================
-
 async def smart_join_runner(session_data, links, mode="smart"):
     safe_mode = (mode == "safe")
 
@@ -83,27 +85,27 @@ async def smart_join_runner(session_data, links, mode="smart"):
     )
 
     results = []
-
     await client.connect()
 
     for token in links:
-        res = await join_single(client, token, safe_mode)
-        results.append({"token": token, "result": res})
+        result = await join_single(client, token, safe_mode)
+        results.append({"token": token, "result": result})
 
-        await asyncio.sleep(random.uniform(2, 5) if mode == "smart" else random.uniform(5, 8))
+        # Smart = أسرع     Safe = أبطأ
+        await asyncio.sleep(
+            random.uniform(2, 5) if mode == "smart" else random.uniform(5, 8)
+        )
 
     await client.disconnect()
-
     return results
 
 
 # ============================================================
-# 🌐 API — Smart Join / Safe Join
+# 🌐 API Endpoint — Smart Join / Safe Join
 # ============================================================
-
-@smart_join_bp.route("/join/smart", methods=["POST"])
+@smart_safe_join_bp.route("/join/smart", methods=["POST"])
 def smart_join_api():
-    payload = request.json
+    payload = request.json or {}
 
     session_name = payload.get("session_name")
     mode = payload.get("mode", "smart")
@@ -122,8 +124,12 @@ def smart_join_api():
     if not links:
         return jsonify({"ok": False, "error": "No valid links found"}), 400
 
+    # تشغيل async
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    data = loop.run_until_complete(smart_join_runner(acc, links, mode))
+
+    data = loop.run_until_complete(
+        smart_join_runner(acc, links, mode)
+    )
 
     return jsonify({"ok": True, "data": data})
