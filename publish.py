@@ -1,89 +1,151 @@
 # -*- coding: utf-8 -*-
 """
-publish.py
-إدارة حملات النشر الذكية في Telegram Maestro
+publish.py — Smart Publishing (MongoDB + Pyrogram Edition)
 """
 
+from flask import Blueprint, request, jsonify, current_app
 import asyncio
 import random
 import logging
-from flask import Blueprint, request
 
-from utils import format_response, run_in_new_loop
-from sessions import run_with_safe_clone
+from pyrogram import Client, errors
 
 publish_bp = Blueprint("publish", __name__)
 
-active_campaigns = {}
+# ==================================================================
+# 🔧 جلب حساب من MongoDB
+# ==================================================================
+def get_account(phone):
+    col = current_app.sessions_collection
+    return col.find_one({"phone": phone})
 
+
+# ==================================================================
+# 📌 نشر رسالة على مجموعة واحدة
+# ==================================================================
+async def send_message_to_group(session_data, group_id, message):
+    client = Client(
+        name=session_data["phone"],
+        session_string=session_data["session"],
+        api_id=session_data["api_id"],
+        api_hash=session_data["api_hash"]
+    )
+
+    try:
+        await client.connect()
+        await client.send_message(group_id, message)
+        await client.disconnect()
+
+        return {"status": "sent", "group": group_id}
+
+    except Exception as e:
+        return {"status": "error", "group": group_id, "error": str(e)}
+
+
+# ==================================================================
+# 📌 جلب جميع مجموعات الحساب (Force All)
+# ==================================================================
+async def fetch_groups(session_data):
+    client = Client(
+        name=session_data["phone"],
+        session_string=session_data["session"],
+        api_id=session_data["api_id"],
+        api_hash=session_data["api_hash"]
+    )
+
+    groups = []
+
+    try:
+        await client.connect()
+        dialogs = await client.get_dialogs()
+
+        for d in dialogs:
+            if d.chat.type in ["supergroup", "group", "channel"]:
+                groups.append(d.chat.id)
+
+        await client.disconnect()
+        return groups
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ==================================================================
+# 📌 بدء نشر لحساب معيّن
+# ==================================================================
+async def start_campaign_for_account(phone, messages, groups, settings):
+    session_data = get_account(phone)
+    if not session_data:
+        logging.error(f"No session found for {phone}")
+        return
+
+    delay = int(settings.get("message_delay", 10))
+    is_force_all = settings.get("is_force_all", False)
+
+    # ---------------------------------------------------------
+    # 🟦 Force All → اجلب مجموعات الحساب
+    # ---------------------------------------------------------
+    if is_force_all:
+        groups = await fetch_groups(session_data)
+        if "error" in groups:
+            logging.error(f"Failed to fetch groups for {phone}")
+            return
+
+    # ---------------------------------------------------------
+    # 🟦 لا توجد مجموعات
+    # ---------------------------------------------------------
+    if not groups:
+        logging.warning(f"No groups to publish for account {phone}")
+        return
+
+    logging.info(f"📢 Campaign started for {phone} on {len(groups)} groups")
+
+    # ---------------------------------------------------------
+    # 🟦 تنفيذ النشر
+    # ---------------------------------------------------------
+    for target in groups:
+        message = random.choice(messages)
+
+        result = await send_message_to_group(session_data, target, message)
+
+        logging.info(f"Sent to {target}: {result}")
+
+        await asyncio.sleep(delay)
+
+    logging.info(f"🏁 Campaign finished for {phone}")
+
+
+# ==================================================================
+# 🌐 API — تشغيل حملة نشر
+# ==================================================================
 @publish_bp.route("/publish", methods=["POST"])
 def publish_route():
     data = request.json or {}
-    selected_accounts = data.get("accounts", [])
+
+    accounts = data.get("accounts", [])
     messages = data.get("messages", [])
     groups = data.get("groups", [])
     settings = data.get("settings", {})
 
-    if not selected_accounts or not messages:
-        return format_response(success=False, error="Accounts and messages are required.", code=400)
+    if not accounts or not messages:
+        return jsonify({"ok": False, "error": "accounts and messages required"}), 400
 
-    for acc in selected_accounts:
-        phone = acc.get("session_id", "").replace("web_session_", "")
+    # ---------------------------------------------------------
+    # 🧵 تشغيل حملة لكل حساب
+    # ---------------------------------------------------------
+    for acc in accounts:
+        phone = acc.get("session_id") or acc.get("phone")
         if not phone:
             continue
-        
-        # Use groups if provided, otherwise it will be handled by start_campaign
-        assigned_groups = groups
 
-        run_in_new_loop(start_campaign_for_account(phone, messages, assigned_groups, settings))
+        # حذف web_session_ إن وجد
+        phone = phone.replace("web_session_", "")
 
-    return format_response(data={"status": "campaign_started", "message": f"Campaign started for {len(selected_accounts)} accounts."})
+        asyncio.get_event_loop().create_task(
+            start_campaign_for_account(phone, messages, groups, settings)
+        )
 
-
-async def start_campaign_for_account(phone, messages, groups, settings):
-    """
-    بدء حملة نشر لحساب واحد.
-    """
-    delay = int(settings.get('message_delay', 10))
-    is_force_all = settings.get('is_force_all', False)
-    
-    groups_to_publish = []
-    if is_force_all:
-        try:
-            # نستخدم run_with_safe_clone لجلب المجموعات بأمان
-            groups_to_publish = await run_with_safe_clone(f"web_session_{phone}", get_account_groups)
-        except Exception as e:
-            logging.error(f"Failed to fetch groups for {phone} for 'Force All' campaign: {e}")
-            return
-    else:
-        groups_to_publish = groups
-
-    if not groups_to_publish:
-        logging.warning(f"No groups to publish to for account {phone}. Campaign will not run.")
-        return
-
-    logging.info(f"Starting campaign for {phone} on {len(groups_to_publish)} groups.")
-
-    for group_target in groups_to_publish:
-        message = random.choice(messages)
-        try:
-            await run_with_safe_clone(f"web_session_{phone}", lambda client: client.send_message(group_target, message))
-            logging.info(f"Message sent to '{group_target}' from {phone}")
-        except Exception as e:
-            logging.error(f"Failed to send to '{group_target}' from {phone}: {e}")
-        
-        await asyncio.sleep(delay)
-    
-    logging.info(f"Campaign finished for account {phone}.")
-
-async def get_account_groups(client):
-    """
-    جلب قائمة بمعرفات جميع المجموعات والقنوات الصالحة للنشر للحساب.
-    """
-    dialogs = await client.get_dialogs()
-    valid_groups = []
-    for d in dialogs:
-        if d.is_group or d.is_channel:
-            valid_groups.append(d.id)
-    return valid_groups
-
+    return jsonify({
+        "ok": True,
+        "message": f"Campaign started for {len(accounts)} accounts."
+    })
