@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 smart_safe_join.py — Smart & Safe Join (Pyrogram + MongoDB Edition)
-Final Production Version — Fully Compatible with app.py and Render
+Final Production Version — Fully Compatible with app.py + MongoDB + Render
 """
 
 from flask import Blueprint, request, jsonify, current_app
@@ -10,13 +10,15 @@ import asyncio
 import re
 import random
 
+
 # ============================================================
-# 🟢 Blueprint — IMPORTANT: Correct name for app.py autoload
+# 🟢 Correct Blueprint Name (Required by app.py)
 # ============================================================
 smart_safe_join_bp = Blueprint("smart_safe_join", __name__)
 
+
 # ============================================================
-# 📌 جلب الحساب من MongoDB
+# 📌 Fetch account from MongoDB
 # ============================================================
 def get_account(phone):
     col = current_app.sessions_collection
@@ -24,10 +26,11 @@ def get_account(phone):
 
 
 # ============================================================
-# 🔍 استخراج الروابط من النص
+# 🔍 Extract links from text
 # ============================================================
 INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)?([A-Za-z0-9_-]+)")
 USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{5,})")
+
 
 def extract_links(text):
     invites = INVITE_RE.findall(text)
@@ -36,7 +39,7 @@ def extract_links(text):
 
 
 # ============================================================
-# 🔑 محاولة الانضمام إلى رابط واحد
+# 🔑 Try joining a single link
 # ============================================================
 async def join_single(client, token, safe_mode=True):
     try:
@@ -54,9 +57,13 @@ async def join_single(client, token, safe_mode=True):
         else:
             info = None
             if safe_mode:
-                info = await client.get_chat(token)
-                if info.type == "channel":
-                    return {"status": "skipped", "reason": "channel_blocked"}
+                try:
+                    info = await client.get_chat(token)
+                    if info.type == "channel":
+                        return {"status": "skipped", "reason": "channel_blocked"}
+                except:
+                    # ignore invalid invite pre-check under safe mode
+                    info = None
 
             await client.join_chat(token)
             return {"status": "joined", "type": "invite_link"}
@@ -72,26 +79,30 @@ async def join_single(client, token, safe_mode=True):
 
 
 # ============================================================
-# 🚀 تنفيذ حملة Smart Join كاملة
+# 🚀 Smart Join Runner
 # ============================================================
 async def smart_join_runner(session_data, links, mode="smart"):
     safe_mode = (mode == "safe")
 
+    # Ensure correct session field name from MongoDB
+    session_string = session_data.get("session") or session_data.get("session_string")
+
     client = Client(
         name=session_data["phone"],
-        session_string=session_data["session"],
+        session_string=session_string,
         api_id=session_data["api_id"],
         api_hash=session_data["api_hash"]
     )
 
     results = []
+
     await client.connect()
 
     for token in links:
         result = await join_single(client, token, safe_mode)
         results.append({"token": token, "result": result})
 
-        # Smart = أسرع     Safe = أبطأ
+        # Smart mode = faster, Safe mode = slower
         await asyncio.sleep(
             random.uniform(2, 5) if mode == "smart" else random.uniform(5, 8)
         )
@@ -114,17 +125,21 @@ def smart_join_api():
     if not session_name:
         return jsonify({"ok": False, "error": "Missing session_name"}), 400
 
-    phone = session_name.replace("web_session_", "")
+    # Extract phone (ensure '+' exists)
+    digits = session_name.replace("web_session_", "")
+    phone = "+" + digits if not digits.startswith("+") else digits
 
+    # Fetch the user session from MongoDB
     acc = get_account(phone)
     if not acc:
         return jsonify({"ok": False, "error": "Account not found"}), 404
 
+    # Extract links from text
     links = extract_links(text)
     if not links:
         return jsonify({"ok": False, "error": "No valid links found"}), 400
 
-    # تشغيل async
+    # Run async logic
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
