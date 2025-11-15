@@ -1,119 +1,96 @@
 # -*- coding: utf-8 -*-
 """
-sessions.py — إدارة جلسات تيليجرام المخزنة في MongoDB بدل الملفات
+sessions.py — النظام الموحد للجلسات (Hybrid: Telethon session file + MongoDB storage)
 """
 
-from flask import Blueprint, jsonify, request, current_app
-from pyrogram import Client
-import asyncio
+import os
+import json
+import logging
+from flask import current_app, Blueprint, request
+from pathlib import Path
 
 sessions_bp = Blueprint("sessions", __name__)
 
+# ============================================
+# ✔ 1 — File-based system (needed for Telethon login)
+# ============================================
 
-# ============================================================
-# 🔧 دوال MongoDB
-# ============================================================
+def get_session_path(base_name: str, suffix: str = '.session') -> str:
+    folder = current_app.config.get("SESSIONS_FOLDER", "./sessions")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"{base_name}{suffix}")
+
+
+def save_session_config(phone: str, api_id: int, api_hash: str):
+    base_name = f"web_session_{phone}"
+    config_path = get_session_path(base_name, '.json')
+    data = {"phone": phone, "api_id": api_id, "api_hash": api_hash}
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return True
+
+
+def load_session_config(phone: str):
+    base_name = f"web_session_{phone}"
+    config_path = get_session_path(base_name, '.json')
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return None
+
+# ============================================
+# ✔ 2 — MongoDB based session storage
+# ============================================
+
+def mongo():
+    return current_app.sessions_collection
+
+def get_session(phone: str):
+    return mongo().find_one({"phone": phone}, {"_id": 0})
+
+def save_session_string(phone: str, api_id: int, api_hash: str, session_string: str):
+    mongo().update_one(
+        {"phone": phone},
+        {"$set": {
+            "phone": phone,
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "session": session_string
+        }},
+        upsert=True
+    )
+
+def delete_session(phone: str):
+    mongo().delete_one({"phone": phone})
+
 
 def get_all_sessions():
-    """جلب كل الحسابات من MongoDB"""
-    col = current_app.sessions_collection
-    return list(col.find({}, {"_id": 0}))
+    return list(mongo().find({}, {"_id": 0}))
 
-def get_session(phone):
-    """جلب جلسة محددة من MongoDB"""
-    col = current_app.sessions_collection
-    doc = col.find_one({"phone": phone})
-    return doc
-
-def delete_session(phone):
-    """حذف حساب من MongoDB"""
-    col = current_app.sessions_collection
-    col.delete_one({"phone": phone})
-
-
-# ============================================================
-# 📌 API: جلب جميع الحسابات
-# ============================================================
+# ============================================
+# ✔ 3 — API Endpoints
+# ============================================
 
 @sessions_bp.route("/sessions/all", methods=["GET"])
-def sessions_all():
-    data = get_all_sessions()
-    return jsonify({"ok": True, "accounts": data})
-
-
-# ============================================================
-# 📌 API: اختبار اتصال حساب معين
-# ============================================================
-
-@sessions_bp.route("/sessions/test", methods=["POST"])
-def test_session():
-    """
-    يستقبل:
-    {
-        "phone": "+966500000000"
+def api_all():
+    return {
+        "ok": True,
+        "accounts": get_all_sessions()
     }
-    """
-    data = request.json
-    phone = data.get("phone")
 
-    if not phone:
-        return jsonify({"ok": False, "error": "Missing phone"}), 400
-
-    acc = get_session(phone)
-    if not acc:
-        return jsonify({"ok": False, "error": "Account not found"}), 404
-
-    session_string = acc.get("session")
-    api_id = acc.get("api_id")
-    api_hash = acc.get("api_hash")
-
-    # إنشاء event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        async def check():
-            client = Client(
-                name=phone,
-                api_id=api_id,
-                api_hash=api_hash,
-                session_string=session_string
-            )
-
-            await client.connect()
-            ok = await client.is_authorized()
-            await client.disconnect()
-            return ok
-
-        authorized = loop.run_until_complete(check())
-
-        return jsonify({"ok": True, "authorized": authorized})
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ============================================================
-# 📌 API: حذف حساب
-# ============================================================
 
 @sessions_bp.route("/sessions/delete", methods=["POST"])
-def delete_acc():
-    data = request.json
-    phone = data.get("phone")
-
+def api_delete():
+    phone = request.json.get("phone")
     if not phone:
-        return jsonify({"ok": False, "error": "Missing phone"}), 400
-
+        return {"ok": False, "error": "Missing phone"}, 400
     delete_session(phone)
-    return jsonify({"ok": True, "message": "Account deleted"})
+    return {"ok": True, "message": "Deleted"}
 
-
-# ============================================================
-# 📌 API: عدد الحسابات
-# ============================================================
 
 @sessions_bp.route("/sessions/count", methods=["GET"])
-def count_sessions():
-    count = len(get_all_sessions())
-    return jsonify({"ok": True, "count": count})
+def api_count():
+    return {"ok": True, "count": len(get_all_sessions())}
