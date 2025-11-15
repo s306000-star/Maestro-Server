@@ -16,7 +16,7 @@ from sessions import (
     load_session_config,
     save_session_string,   # لحفظ StringSession في MongoDB
 )
-from config import APP_CONFIG  # لاستخدام SESSIONS_FOLDER وغيره
+from config import CONFIG
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -34,7 +34,8 @@ def _normalize_phone(raw: str) -> str:
 def _tmp_auth_file(phone: str) -> str:
     """مسار ملف الحالة المؤقتة لهذه العملية."""
     fname = f"tmp_auth_{phone.replace('+','')}.json"
-    folder = APP_CONFIG.get("SESSIONS_FOLDER", "./sessions")
+    # Since SESSIONS_FOLDER is removed from config, we define a local temp folder.
+    folder = "./sessions"
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, fname)
 
@@ -133,19 +134,15 @@ def send_code_compat_route():
     """
     data = request.json or {}
 
-    api_id = data.get("apiId") or data.get("api_id")
-    api_hash = data.get("apiHash") or data.get("api_hash")
-    raw_phone = (
-        data.get("phone")
-        or data.get("phone_number")
-        or data.get("phoneNumber")
-    )
+    api_id = data.get("api_id")
+    api_hash = data.get("api_hash")
+    raw_phone = data.get("phone")
     phone = _normalize_phone(raw_phone)
 
     if not all([api_id, api_hash, phone]):
         return format_response(
             success=False,
-            error="Missing required fields (apiId/api_id, apiHash/api_hash, phone/phone_number).",
+            error="Missing required fields: api_id, api_hash, phone.",
             code=400,
         )
 
@@ -185,14 +182,8 @@ async def _initiate_auth(phone: str, api_id: int, api_hash: str):
         # إرسال الكود
         sent = await client.send_code_request(phone)
         phone_code_hash = sent.phone_code_hash
-
-        # حفظ الحالة في الذاكرة وعلى القرص
-        _set_mem_state(
-            phone,
-            client=session_path_no_ext,
-            phone_code_hash=phone_code_hash,
-            ts=time.time(),
-        )
+        
+        # لا نحفظ العميل، فقط الـ hash
         _persist_temp(
             phone,
             {
@@ -205,7 +196,8 @@ async def _initiate_auth(phone: str, api_id: int, api_hash: str):
         )
 
         await client.disconnect()
-        return format_response(data={"status": "code_sent"})
+        # إرجاع الـ hash إلى الواجهة الأمامية
+        return format_response(data={"status": "code_sent", "phone_code_hash": phone_code_hash})
 
     except errors.PhoneNumberInvalidError:
         await client.disconnect()
@@ -214,7 +206,8 @@ async def _initiate_auth(phone: str, api_id: int, api_hash: str):
         )
     except Exception as e:
         logging.exception(f"Error during initiate_auth for {phone}: {e}")
-        await client.disconnect()
+        if client.is_connected():
+            await client.disconnect()
         return format_response(success=False, error=str(e), code=500)
 
 
@@ -247,26 +240,26 @@ def resend_code_route():
 # ============================================================
 @auth_bp.route("/login", methods=["POST"])
 @auth_bp.route("/Login", methods=["POST"])
-@auth_bp.route("/verify-code", methods=["POST"])
+@auth_bp.route("/verify", methods=["POST"])
 def login_route():
     """
     body المقبول:
-      - { phone, code }
+      - { phone, code, phone_code_hash }
       - { phone, password }
-      - { phone_number, phone_code }
     """
     data = request.json or {}
 
-    raw_phone = data.get("phone") or data.get("phone_number")
+    raw_phone = data.get("phone")
     phone = _normalize_phone(raw_phone)
 
-    code = data.get("code") or data.get("phone_code")
+    code = data.get("code")
     password = data.get("password")
+    phone_code_hash = data.get("phone_code_hash")
 
     if not phone or (not code and not password):
         return format_response(
             success=False,
-            error="Phone (or phone_number) and code/phone_code or password are required.",
+            error="Phone and (code with phone_code_hash) or password are required.",
             code=400,
         )
 
@@ -274,33 +267,23 @@ def login_route():
         f"[AUTH] Login attempt for phone={phone}, has_code={bool(code)}, has_password={bool(password)}"
     )
 
-    return run_in_new_loop(_verify_login(phone, code, password))
+    return run_in_new_loop(_verify_login(phone, code, password, phone_code_hash))
 
 
-async def _verify_login(phone: str, code: str | None, password: str | None):
-    # 1) من الذاكرة
-    mem_state = _get_mem_state(phone)
-
-    # 2) من القرص لو غير موجود
-    if not mem_state:
-        file_state = _load_temp(phone)
-        if file_state:
-            mem_state = {
-                "client": file_state.get("session_path_no_ext"),
-                "phone_code_hash": file_state.get("phone_code_hash"),
-                "ts": file_state.get("ts"),
-            }
-            _set_mem_state(phone, **mem_state)
-
-    if not mem_state:
+async def _verify_login(phone: str, code: str | None, password: str | None, phone_code_hash: str | None):
+    
+    # 1) من القرص لو غير موجود في الذاكرة
+    temp_state = _load_temp(phone)
+    if not temp_state:
         return format_response(
             success=False,
-            error="Session expired or invalid. Please start over.",
+            error="Session expired or invalid. Please start over by sending code again.",
             code=400,
         )
 
-    session_path_no_ext = mem_state["client"]
-    phone_code_hash = mem_state.get("phone_code_hash")
+    session_path_no_ext = temp_state.get("session_path_no_ext")
+    if not phone_code_hash:
+        phone_code_hash = temp_state.get("phone_code_hash")
 
     cfg = load_session_config(phone)
     if not cfg:
@@ -321,7 +304,6 @@ async def _verify_login(phone: str, code: str | None, password: str | None):
         if await client.is_user_authorized():
             me = await client.get_me()
             await client.disconnect()
-            _drop_mem_state(phone)
             _cleanup_temp(phone)
             return format_response(
                 data={
@@ -336,7 +318,7 @@ async def _verify_login(phone: str, code: str | None, password: str | None):
             if not phone_code_hash:
                 return format_response(
                     success=False,
-                    error="phone_code_hash is missing for code verification. Please resend code.",
+                    error="phone_code_hash is missing. Please start over by sending code again.",
                     code=400,
                 )
             await client.sign_in(
@@ -345,21 +327,20 @@ async def _verify_login(phone: str, code: str | None, password: str | None):
 
         me = await client.get_me()
 
-        # حفظ الكونفيج + StringSession في MongoDB
-        save_session_config(phone, api_id, api_hash)
-        string_session = StringSession.save(client.session)
+        # حفظ الكونفيج + StringSession
+        string_session = client.session.save()
+        # Use the new function from the updated sessions.py
         save_session_string(phone, api_id, api_hash, string_session)
-
-        _drop_mem_state(phone)
+        
         _cleanup_temp(phone)
 
         logging.info(f"[AUTH] Login successful for {phone}")
 
         return format_response(
             data={
-                "status": "logged_in",
+                "status": "login_success",
                 "user_id": me.id,
-                "first_name": getattr(me, "first_name", ""),
+                "user": getattr(me, "first_name", ""),
                 "session_string": string_session,
             }
         )
@@ -371,13 +352,13 @@ async def _verify_login(phone: str, code: str | None, password: str | None):
         )
     except errors.SessionPasswordNeededError:
         logging.warning(f"Password (2FA) required for phone {phone}")
-        return format_response(
-            success=False,
-            error="Two-factor authentication enabled. Please provide password.",
-            code=401,
-        )
+        # لا نعتبرها خطأ، بل حالة خاصة للواجهة
+        return format_response(data={"status": "2fa_needed"})
     except Exception as e:
         logging.exception(f"Error during verify_login for {phone}: {e}")
         return format_response(success=False, error=str(e), code=500)
     finally:
-        await client.disconnect()
+        if client.is_connected():
+            await client.disconnect()
+
+    
