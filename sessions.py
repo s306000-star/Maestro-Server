@@ -6,7 +6,7 @@ sessions.py — النظام الموحد للجلسات (Hybrid: Telethon sessi
 import os
 import json
 import logging
-from flask import current_app, Blueprint, request
+from flask import current_app, Blueprint, request, jsonify
 from pathlib import Path
 
 sessions_bp = Blueprint("sessions", __name__)
@@ -66,7 +66,6 @@ def save_session_string(phone: str, api_id: int, api_hash: str, session_string: 
 def delete_session(phone: str):
     mongo().delete_one({"phone": phone})
 
-
 def get_all_sessions():
     return list(mongo().find({}, {"_id": 0}))
 
@@ -81,7 +80,6 @@ def api_all():
         "accounts": get_all_sessions()
     }
 
-
 @sessions_bp.route("/sessions/delete", methods=["POST"])
 def api_delete():
     phone = request.json.get("phone")
@@ -90,7 +88,22 @@ def api_delete():
     delete_session(phone)
     return {"ok": True, "message": "Deleted"}
 
-
 @sessions_bp.route("/sessions/count", methods=["GET"])
 def api_count():
     return {"ok": True, "count": len(get_all_sessions())}
+
+
+# ============================================
+# ⭐ NEW REQUIRED ENDPOINT FOR FRONTEND
+# ============================================
+@sessions_bp.route("/sessions/list", methods=["GET"])
+def api_list():
+    """
+    هذا هو المسار الذي تحتاجه الواجهة (Frontend)
+    ليتم تحميل الحسابات بدون Timeout.
+    """
+    try:
+        accounts = get_all_sessions()
+        return jsonify({"ok": True, "accounts": accounts}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
