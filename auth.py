@@ -11,7 +11,6 @@ import logging, os, json, time
 
 from utils import format_response, run_in_new_loop
 from sessions import (
-    get_session_path,
     save_session_config,
     load_session_config,
     save_session_string,   # لحفظ StringSession في MongoDB
@@ -31,67 +30,29 @@ def _normalize_phone(raw: str) -> str:
     digits = "".join(ch for ch in str(raw) if ch.isdigit())
     return f"+{digits}"
 
-def _tmp_auth_file(phone: str) -> str:
-    """مسار ملف الحالة المؤقتة لهذه العملية."""
-    fname = f"tmp_auth_{phone.replace('+','')}.json"
-    # Since SESSIONS_FOLDER is removed from config, we define a local temp folder.
+def _get_temp_session_path(phone: str) -> str:
+    """Returns the path for the temporary session file."""
     folder = "./sessions"
     os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, fname)
+    return os.path.join(folder, f"tmp_auth_{phone.replace('+', '')}")
 
-def _persist_temp(phone: str, data: dict):
-    """حفظ الحالة المؤقتة (hash/اسم الجلسة) على القرص."""
-    try:
-        path = _tmp_auth_file(phone)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        logging.warning(f"Failed to persist temp auth state for {phone}: {e}")
-
-def _load_temp(phone: str):
-    """تحميل الحالة المؤقتة من القرص."""
-    path = _tmp_auth_file(phone)
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logging.warning(f"Failed to load temp auth state for {phone}: {e}")
-    return None
-
-def _cleanup_temp(phone: str):
-    """حذف الحالة المؤقتة من القرص."""
-    path = _tmp_auth_file(phone)
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        logging.warning(f"Failed to cleanup temp auth for {phone}: {e}")
-
-# حالة مؤقتة في الذاكرة لتسريع العملية
-_temp_clients: dict[str, dict] = {}
-
-def _set_mem_state(phone: str, **kwargs):
-    state = _temp_clients.get(phone, {})
-    state.update(kwargs)
-    _temp_clients[phone] = state
-
-def _get_mem_state(phone: str) -> dict | None:
-    return _temp_clients.get(phone)
-
-def _drop_mem_state(phone: str):
-    if phone in _temp_clients:
-        del _temp_clients[phone]
-
-def _make_client(session_path_no_ext: str, api_id: int, api_hash: str) -> TelegramClient:
-    return TelegramClient(session_path_no_ext, api_id, api_hash)
-
+def _cleanup_temp_files(phone: str):
+    """Deletes temporary session files."""
+    session_path = _get_temp_session_path(phone)
+    for ext in [".session", ".session-journal"]:
+        try:
+            f_path = f"{session_path}{ext}"
+            if os.path.exists(f_path):
+                os.remove(f_path)
+                logging.info(f"Cleaned up {f_path}")
+        except Exception as e:
+            logging.warning(f"Failed to cleanup temp file for {phone}: {e}")
 
 # ============================================================
 # حفظ الحساب وبدء إرسال الكود  (المسار الرسمي الجديد)
 # ============================================================
 @auth_bp.route("/save-account", methods=["POST"])
-@auth_bp.route("/Save-Account", methods=["POST"])  # دعم شكل آخر لو أرسله front-end
+@auth_bp.route("/Save-Account", methods=["POST"])
 def save_account_route():
     """
     نقطة البداية لإضافة حساب جديد: تحفظ الإعدادات الأولية وتبدأ إرسال الكود.
@@ -134,8 +95,8 @@ def send_code_compat_route():
     """
     data = request.json or {}
 
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
+    api_id = data.get("api_id") or data.get("apiId")
+    api_hash = data.get("api_hash") or data.get("apiHash")
     raw_phone = data.get("phone")
     phone = _normalize_phone(raw_phone)
 
@@ -156,48 +117,20 @@ def send_code_compat_route():
 # ============================================================
 async def _initiate_auth(phone: str, api_id: int, api_hash: str):
     """
-    يتصل، ويرسل كود التحقق، ويحفظ phone_code_hash مؤقتًا (في الذاكرة وعلى القرص).
+    يتصل، ويرسل كود التحقق، ويحفظ phone_code_hash مؤقتًا.
     """
-    # Use a file-based session for the initial authentication
-    session_base = f"web_session_{phone}"
-    session_path_no_ext = get_session_path(session_base).replace(".session", "")
-
-    client = TelegramClient(session_path_no_ext, api_id, api_hash)
+    session_path = _get_temp_session_path(phone)
+    client = TelegramClient(session_path, api_id, api_hash)
 
     try:
         logging.info(f"Connecting client for {phone} to send code...")
         await client.connect()
-        logging.info(f"Client connected for {phone}.")
-
-        # إذا الجلسة قديمة ومصرّح بها بالفعل
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            await client.disconnect()
-            _cleanup_temp(phone)
-            logging.info(f"Account {phone} is already authorized.")
-            return format_response(
-                data={
-                    "status": "already_authorized",
-                    "user": getattr(me, "first_name", ""),
-                }
-            )
 
         # إرسال الكود
-        logging.info(f"Sending code request to {phone}...")
         sent = await client.send_code_request(phone)
         phone_code_hash = sent.phone_code_hash
         logging.info(f"Code sent successfully to {phone}.")
         
-        # لا نحفظ العميل، فقط الـ hash والمعلومات اللازمة
-        _persist_temp(
-            phone,
-            {
-                "session_path_no_ext": session_path_no_ext,
-                "phone_code_hash": phone_code_hash,
-                "ts": time.time(),
-            },
-        )
-
         return format_response(data={"status": "code_sent", "phone_code_hash": phone_code_hash})
 
     except errors.PhoneNumberInvalidError:
@@ -248,7 +181,7 @@ def login_route():
     """
     body المقبول:
       - { phone, code, phone_code_hash }
-      - { phone, password }
+      - { phone, password, phone_code_hash }
     """
     data = request.json or {}
 
@@ -259,10 +192,10 @@ def login_route():
     password = data.get("password")
     phone_code_hash = data.get("phone_code_hash")
 
-    if not phone or (not code and not password):
+    if not phone or (not code and not password) or not phone_code_hash:
         return format_response(
             success=False,
-            error="Phone and (code with phone_code_hash) or password are required.",
+            error="Phone, phone_code_hash, and either code or password are required.",
             code=400,
         )
 
@@ -273,22 +206,8 @@ def login_route():
     return run_in_new_loop(_verify_login(phone, code, password, phone_code_hash))
 
 
-async def _verify_login(phone: str, code: str | None, password: str | None, phone_code_hash: str | None):
+async def _verify_login(phone: str, code: str | None, password: str | None, phone_code_hash: str):
     
-    # 1) من القرص لو غير موجود في الذاكرة
-    temp_state = _load_temp(phone)
-    if not temp_state:
-        return format_response(
-            success=False,
-            error="Session expired or invalid. Please start over by sending code again.",
-            code=400,
-        )
-
-    session_path_no_ext = temp_state.get("session_path_no_ext")
-    # Use the hash from the temp file if not provided in the request
-    if not phone_code_hash:
-        phone_code_hash = temp_state.get("phone_code_hash")
-
     cfg = load_session_config(phone)
     if not cfg:
         return format_response(
@@ -300,31 +219,16 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
     api_id = int(cfg["api_id"])
     api_hash = str(cfg["api_hash"])
 
-    client = _make_client(session_path_no_ext, api_id, api_hash)
+    # Use the temporary file session for this process
+    session_path = _get_temp_session_path(phone)
+    client = TelegramClient(session_path, api_id, api_hash)
 
     try:
         await client.connect()
 
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            await client.disconnect()
-            _cleanup_temp(phone)
-            return format_response(
-                data={
-                    "status": "already_authorized",
-                    "user": getattr(me, "first_name", ""),
-                }
-            )
-
         if password:
-            await client.sign_in(phone=phone, password=password)
+            await client.sign_in(password=password)
         else:
-            if not phone_code_hash:
-                return format_response(
-                    success=False,
-                    error="phone_code_hash is missing. Please start over by sending code again.",
-                    code=400,
-                )
             await client.sign_in(
                 phone=phone, code=str(code), phone_code_hash=phone_code_hash
             )
@@ -333,11 +237,8 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
 
         # حفظ الكونفيج + StringSession
         string_session = client.session.save()
-        # Use the new function from the updated sessions.py
         save_session_string(phone, api_id, api_hash, string_session)
         
-        _cleanup_temp(phone)
-
         logging.info(f"[AUTH] Login successful for {phone}")
 
         return format_response(
@@ -364,3 +265,7 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
     finally:
         if client.is_connected():
             await client.disconnect()
+        # Clean up temporary files after the process is complete
+        _cleanup_temp_files(phone)
+
+    
