@@ -267,5 +267,3 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
             await client.disconnect()
         # Clean up temporary files after the process is complete
         _cleanup_temp_files(phone)
-
-    
