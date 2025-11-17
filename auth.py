@@ -158,20 +158,23 @@ async def _initiate_auth(phone: str, api_id: int, api_hash: str):
     """
     يتصل، ويرسل كود التحقق، ويحفظ phone_code_hash مؤقتًا (في الذاكرة وعلى القرص).
     """
+    # Use a file-based session for the initial authentication
     session_base = f"web_session_{phone}"
     session_path_no_ext = get_session_path(session_base).replace(".session", "")
 
-    client = _make_client(session_path_no_ext, api_id, api_hash)
+    client = TelegramClient(session_path_no_ext, api_id, api_hash)
 
     try:
+        logging.info(f"Connecting client for {phone} to send code...")
         await client.connect()
+        logging.info(f"Client connected for {phone}.")
 
         # إذا الجلسة قديمة ومصرّح بها بالفعل
         if await client.is_user_authorized():
             me = await client.get_me()
             await client.disconnect()
-            _drop_mem_state(phone)
             _cleanup_temp(phone)
+            logging.info(f"Account {phone} is already authorized.")
             return format_response(
                 data={
                     "status": "already_authorized",
@@ -180,35 +183,35 @@ async def _initiate_auth(phone: str, api_id: int, api_hash: str):
             )
 
         # إرسال الكود
+        logging.info(f"Sending code request to {phone}...")
         sent = await client.send_code_request(phone)
         phone_code_hash = sent.phone_code_hash
+        logging.info(f"Code sent successfully to {phone}.")
         
-        # لا نحفظ العميل، فقط الـ hash
+        # لا نحفظ العميل، فقط الـ hash والمعلومات اللازمة
         _persist_temp(
             phone,
             {
                 "session_path_no_ext": session_path_no_ext,
                 "phone_code_hash": phone_code_hash,
-                "api_id": int(api_id),
-                "api_hash": str(api_hash),
                 "ts": time.time(),
             },
         )
 
-        await client.disconnect()
-        # إرجاع الـ hash إلى الواجهة الأمامية
         return format_response(data={"status": "code_sent", "phone_code_hash": phone_code_hash})
 
     except errors.PhoneNumberInvalidError:
-        await client.disconnect()
+        logging.error(f"Invalid phone number: {phone}")
         return format_response(
             success=False, error="Invalid phone number.", code=400
         )
     except Exception as e:
         logging.exception(f"Error during initiate_auth for {phone}: {e}")
+        return format_response(success=False, error=str(e), code=500)
+    finally:
         if client.is_connected():
             await client.disconnect()
-        return format_response(success=False, error=str(e), code=500)
+            logging.info(f"Client for {phone} disconnected.")
 
 
 # ============================================================
@@ -282,6 +285,7 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
         )
 
     session_path_no_ext = temp_state.get("session_path_no_ext")
+    # Use the hash from the temp file if not provided in the request
     if not phone_code_hash:
         phone_code_hash = temp_state.get("phone_code_hash")
 
@@ -360,16 +364,3 @@ async def _verify_login(phone: str, code: str | None, password: str | None, phon
     finally:
         if client.is_connected():
             await client.disconnect()
-
-    
-@auth_bp.route("/auth/accounts", methods=["GET"])
-def get_accounts_route():
-    # This is a placeholder as accounts are now fetched from sessions/all
-    from sessions import get_all_sessions
-    try:
-        accounts = get_all_sessions()
-        return format_response(data={"accounts": accounts})
-    except Exception as e:
-        return format_response(success=False, error=str(e), code=500)
-
-    
