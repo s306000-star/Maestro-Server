@@ -39,18 +39,26 @@ logger.info("🚀 Initializing Telegram Maestro Backend...")
 # ============================================================
 try:
     MONGO_URL = os.getenv("MONGO_URL")
-    mongo_client = MongoClient(MONGO_URL)
+    if not MONGO_URL:
+        logger.warning("⚠️ MONGO_URL environment variable is not set. Database features will be disabled.")
+        app.mongo_db = None
+        app.sessions_collection = None
+    else:
+        mongo_client = MongoClient(MONGO_URL)
 
-    mongo_db = mongo_client["maestro_sessions_db"]
-    sessions_collection = mongo_db["sessions"]
+        mongo_db = mongo_client["maestro_sessions_db"]
+        sessions_collection = mongo_db["sessions"]
 
-    # تخزين الاتصال داخل Flask app
-    app.mongo_db = mongo_db
-    app.sessions_collection = sessions_collection
+        # تخزين الاتصال داخل Flask app
+        app.mongo_db = mongo_db
+        app.sessions_collection = sessions_collection
 
-    logger.info("🟢 Connected successfully to MongoDB!")
+        logger.info("🟢 Connected successfully to MongoDB!")
 except Exception as e:
     logger.error(f"❌ MongoDB Connection Error: {e}", exc_info=True)
+    app.mongo_db = None
+    app.sessions_collection = None
+
 
 # ============================================================
 # 📁 تجهيز مجلدات المشروع (إن وجدت)
@@ -69,13 +77,24 @@ modules = [
     "sgroups",
     "publish",
     "filters",
-    "smart_safe_join"   # ← مهم جدًا
+    "smart_safe_join"
 ]
 
 for module_name in modules:
     try:
         mod = import_module(module_name)
-        bp = getattr(mod, f"{module_name}_bp")  # ← يبحث عن smart_safe_join_bp
+        # Fix: 'smart_safe_join' module has 'smart_join_bp'
+        # and handle the new 'verify' endpoint in auth
+        if module_name == "smart_safe_join":
+            blueprint_name = "smart_join_bp"
+        elif module_name == "auth":
+             # The auth module now has multiple blueprints if you separate verify
+             # but for now it's just one.
+             blueprint_name = "auth_bp"
+        else:
+            blueprint_name = f"{module_name}_bp"
+            
+        bp = getattr(mod, blueprint_name)
         app.register_blueprint(bp, url_prefix="/api")
         logger.info(f"✅ Registered module: {module_name}")
     except Exception as e:
@@ -91,7 +110,7 @@ def index():
         "service": "Telegram Maestro Backend",
         "version": "2.0",
         "status": "running",
-        "mongo": "connected",
+        "mongo": "connected" if app.mongo_db else "disconnected",
         "modules": modules
     }), 200
 
